@@ -288,8 +288,7 @@ class FlowmatchingActionHead(nn.Module):
 
 
         # embed state
-        state_features = self.state_encoder(state) if state is not None else None
-
+        state_features = self.state_encoder(state).unsqueeze(1) if state is not None else None  # (B, 1, H)
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
@@ -330,7 +329,7 @@ class FlowmatchingActionHead(nn.Module):
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
         
-        state_features = self.state_encoder(state) if state is not None else None
+        state_features = self.state_encoder(state).unsqueeze(1) if state is not None else None  # (B, 1, H)
 
         # Run denoising steps.
         for t in range(num_steps):

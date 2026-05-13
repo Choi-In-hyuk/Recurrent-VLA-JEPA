@@ -28,6 +28,8 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
+from starVLA.model.modules.fusion.gating import LearnedGatingFusion
+from starVLA.model.modules.projector.vj_to_dit import VJtoDiTProjection
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -110,6 +112,27 @@ class VLA_JEPA(baseframework):
         self._ema_alpha = None
         self._ema_y     = None   # (feat_dim,) numpy per batch item
 
+        # Phase 2: Recurrent JEPA training modules (config-driven)
+        recurrent_cfg = getattr(self.config.framework, "recurrent_jepa", None)
+        if recurrent_cfg and getattr(recurrent_cfg, "enabled", False):
+            vj_dim  = self.vj_encoder.config.hidden_size * 2           # 2816
+            dit_dim = self.qwen_vl_interface.model.config.hidden_size   # 2048
+            n_cond  = getattr(recurrent_cfg, "n_cond_tokens", 8)
+            use_cos = getattr(recurrent_cfg, "use_cosine", True)
+            self.fusion    = LearnedGatingFusion(vj_dim, use_cosine=use_cos)
+            self.vj_to_dit = VJtoDiTProjection(vj_dim, dit_dim, n_cond)
+            self._recurrent_training = True
+            logger.info(f"[Recurrent-JEPA] Phase 2 modules initialised  n_cond={n_cond}")
+        else:
+            self._recurrent_training = False
+
+        # Recurrent JEPA state (enabled by load_recurrent; None = disabled)
+        self._recurrent_enabled = False
+        self._vj_prev_obs   = None  # (B, spatial_tokens, vj_embed_dim*V)
+        self._prev_action_t = None  # (B, (T-1)*num_add_tokens, qwen_H)
+        self._last_vj_pred  = None  # (B, spatial_tokens, vj_embed_dim*V); set after each predict_action
+        self._last_vj_pred  = None  # (B, spatial_tokens, vj_embed_dim*V) — set after each predict_action
+
     def load_kf(self, lds_path: str, q_noise: float = 0.1, r_noise: float = 5.0) -> None:
         """Load a trained LearnedLDS and enable KF filtering on embodied_action_tokens."""
         import sys
@@ -139,6 +162,59 @@ class VLA_JEPA(baseframework):
     def reset_ema(self) -> None:
         """Reset EMA state (call at episode start)."""
         self._ema_y = None
+
+    def load_recurrent(self) -> None:
+        """Enable recurrent JEPA inference mode (Phase 1: sanity check)."""
+        self._recurrent_enabled = True
+        self._vj_prev_obs   = None
+        self._prev_action_t = None
+        self._last_vj_pred  = None
+        logger.info("[Recurrent-JEPA] Enabled — will log pred/obs cosine_sim each step.")
+
+    def reset_recurrent(self) -> None:
+        """Reset recurrent JEPA state (call at episode start)."""
+        self._vj_prev_obs   = None
+        self._prev_action_t = None
+        self._last_vj_pred  = None
+
+    def _encode_vj_from_images(self, batch_images: list) -> torch.Tensor:
+        """Encode current-frame PIL images through V-JEPA encoder.
+
+        Replicates each PIL image to fill the encoder's temporal dimension,
+        runs vj_encoder, and returns the LAST frame's spatial tokens so that
+        the shape matches one timestep of training embeddings.
+
+        Returns: (B, spatial_tokens, vj_hidden * V)  on vj_encoder's device
+        """
+        num_frames = self.config.framework.vj2_model.num_frames  # e.g. 8
+        B = len(batch_images)
+        V = len(batch_images[0])
+
+        input_videos = []
+        for b in range(B):
+            for v in range(V):
+                img_np = np.array(batch_images[b][v])          # (H, W, 3) uint8
+                frame  = torch.from_numpy(img_np).permute(2, 0, 1)  # (3, H, W)
+                frames = frame.unsqueeze(0).repeat(num_frames, 1, 1, 1)  # (T, 3, H, W)
+                processed = self.vj_processor(
+                    videos=frames, return_tensors="pt"
+                )["pixel_values_videos"].to(self.vj_encoder.device)  # (1, T, 3, H, W)
+                input_videos.append(processed)
+
+        input_videos = torch.cat(input_videos, dim=0)  # (B*V, T, 3, H, W)
+
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            embeddings = self.vj_encoder.get_vision_features(
+                pixel_values_videos=input_videos
+            )  # (B*V, T//tubelet * spatial, hidden)
+
+        embeddings = torch.cat(torch.chunk(embeddings, chunks=V, dim=0), dim=2)
+        # (B, T//tubelet * spatial, V*hidden)
+
+        tubelet  = self.vj_encoder.config.tubelet_size
+        T_enc    = num_frames // tubelet
+        spatial  = embeddings.shape[1] // T_enc
+        return embeddings[:, -spatial:, :].float()  # (B, spatial, V*hidden)
 
     def _ema_step(self, y_obs: np.ndarray) -> np.ndarray:
         """One EMA step.  y_obs: (feat_dim,) → returns smoothed (feat_dim,)."""
@@ -302,13 +378,21 @@ class VLA_JEPA(baseframework):
                 gt_states,
                 reduction="mean"
             )
-        
+
+            # Phase 2: fuse last obs + last prediction → conditioning for DiT
+            cond_t = None
+            if self._recurrent_training:
+                spatial      = video_embeddings.shape[1] // T
+                vj_obs_last  = video_embeddings[:, -spatial:, :].detach()   # (B, 256, 2816)
+                vj_pred_last = predicted_states[:, -spatial:, :].detach()   # (B, 256, 2816)
+                fused_t = self.fusion(vj_obs_last.float(), vj_pred_last.float())
+                cond_t  = self.vj_to_dit(fused_t)                           # (B, n_cond, 2048)
+
         if "action" not in examples[0]:
             return {"wm_loss": teacher_forcing_wm_loss}
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
-            # 标签对齐：取最后 chunk_len 段
             actions = torch.tensor(
                 np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
             )  # [B, T_full, action_dim]
@@ -319,18 +403,22 @@ class VLA_JEPA(baseframework):
             )
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             embodied_action_repeated = embodied_action_tokens.repeat(repeated_diffusion_steps, 1, 1)
-            
+
+            # Concat Cond_t (from world model) with embodied_action tokens
+            if cond_t is not None:
+                cond_t_repeated  = cond_t.repeat(repeated_diffusion_steps, 1, 1)
+                dit_input = torch.cat([embodied_action_repeated, cond_t_repeated], dim=1)
+            else:
+                dit_input = embodied_action_repeated
+
             state_repeated = None
             if state is not None:
                 state = torch.tensor(
                     np.array(state), device=last_hidden.device, dtype=last_hidden.dtype
                 )
-                #print(state.shape)
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            #print(embodied_action_repeated.shape, actions_target_repeated.shape, state_repeated.shape) if state_repeated is not None else print("No state for action model")
-            #exit()
-            action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
+            action_loss = self.action_model(dit_input, actions_target_repeated, state_repeated)
 
         return {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss * 0.1}
 
@@ -388,6 +476,53 @@ class VLA_JEPA(baseframework):
             B, _, H = last_hidden.shape
             embodied_action_tokens = last_hidden[embodied_action_indices[0], embodied_action_indices[1], :].view(B, -1, H)
 
+            # Extract <|action_i|> tokens for vj_predictor conditioning
+            action_indices_for_pred = torch.isin(
+                qwen_inputs['input_ids'],
+                torch.tensor(self.action_token_ids, device=qwen_inputs['input_ids'].device)
+            ).nonzero(as_tuple=True)
+            action_tokens_for_pred = last_hidden[
+                action_indices_for_pred[0], action_indices_for_pred[1], :
+            ].view(B, -1, H)  # (B, (T-1)*num_add_tokens, H)
+
+        # Recurrent JEPA inference loop (Phase 1: logging / Phase 2: fusion)
+        cond_t_inf = None
+        if self._recurrent_enabled or self._recurrent_training:
+            if kwargs.get("reset_kf", False):
+                self.reset_recurrent()
+
+            vj_obs_t = self._encode_vj_from_images(batch_images)  # (B, spatial, D)
+
+            if self._vj_prev_obs is not None:
+                tubelet  = self.vj_encoder.config.tubelet_size
+                T_pred   = self.config.framework.vj2_model.num_frames // tubelet - 1  # T-1
+                prev_exp = self._vj_prev_obs.repeat(1, T_pred, 1)  # (B, T_pred*spatial, D)
+                num_add  = self.config.framework.vj2_model.num_action_tokens_per_timestep
+                prev_act = self._prev_action_t[:, :T_pred * num_add, :]
+
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    vj_pred_raw = self.vj_predictor(prev_exp, prev_act)
+                spatial      = vj_obs_t.shape[1]
+                vj_pred_last = vj_pred_raw[:, -spatial:, :].float()  # (B, spatial, D)
+
+                cos_sim = F.cosine_similarity(vj_obs_t, vj_pred_last, dim=-1).mean().item()
+                logger.info(f"[Recurrent-JEPA] pred/obs cosine_sim = {cos_sim:.4f}")
+
+                self._last_vj_pred = vj_pred_last.detach()
+
+                if self._recurrent_training:
+                    fused_inf  = self.fusion(vj_obs_t, vj_pred_last)
+                    cond_t_inf = self.vj_to_dit(fused_inf)          # (B, n_cond, dit_dim)
+            else:
+                # cold start: no prediction yet — use obs only for conditioning
+                self._last_vj_pred = vj_obs_t.detach()
+                if self._recurrent_training:
+                    cond_t_inf = self.vj_to_dit(vj_obs_t)
+
+            # Update recurrent state
+            self._vj_prev_obs   = vj_obs_t.detach()
+            self._prev_action_t = action_tokens_for_pred.detach()
+
         # KF filtering on embodied_action_tokens (if LDS loaded)
         if self._lds is not None:
             if kwargs.get("reset_kf", False):
@@ -409,9 +544,12 @@ class VLA_JEPA(baseframework):
             embodied_action_tokens = embodied_action_tokens + correction.unsqueeze(1)
 
         state = torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype) if state is not None else None
-        # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(embodied_action_tokens, state)  # (B, chunk_len, action_dim)
+            if cond_t_inf is not None:
+                dit_input = torch.cat([embodied_action_tokens, cond_t_inf], dim=1)
+            else:
+                dit_input = embodied_action_tokens
+            pred_actions = self.action_model.predict_action(dit_input, state)
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions, "embodied_action_tokens": embodied_action_tokens.to(dtype=torch.float32).detach().cpu().numpy()}
