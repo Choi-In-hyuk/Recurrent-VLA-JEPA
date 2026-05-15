@@ -8,6 +8,11 @@ For each LIBERO demo, saves one .pt file per sampled timestep:
     "emb_tokens": (32, 2048)  float32  -- QwenVL embodied_action_tokens
     "actions":    (action_horizon, 7)  float32  -- delta_qpos target
     "states":     (8,)        float32  -- joint_states(7) + gripper(1)
+    # Stage 3 metadata (for QwenVL re-run with correction injection):
+    "instruction": str        -- task instruction string
+    "hdf5_path":   str        -- path to source HDF5 file
+    "demo_key":    str        -- demo key within HDF5 (e.g. "demo_0")
+    "timestep":    int        -- timestep index t within the demo
   }
 
 Usage:
@@ -87,6 +92,11 @@ def extract_demo(model, hdf5_path, demo_key, task_str, device, chunk_size, actio
             "emb_tokens": result["embodied_action_tokens"][0],             # (32, 2048)
             "actions":    padded_actions[t : t + action_horizon],          # (action_horizon, 7)
             "states":     states_full[t],                                  # (8,)
+            # Stage 3 metadata
+            "instruction": task_str,
+            "hdf5_path":   hdf5_path,
+            "demo_key":    demo_key,
+            "timestep":    t,
         })
 
     return samples

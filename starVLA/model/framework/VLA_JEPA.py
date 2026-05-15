@@ -30,6 +30,7 @@ from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_mod
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 from starVLA.model.modules.fusion.gating import LearnedGatingFusion
 from starVLA.model.modules.projector.vj_to_dit import VJtoDiTProjection
+from starVLA.model.modules.projector.correction_projector import CorrectionProjector
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -100,6 +101,11 @@ class VLA_JEPA(baseframework):
         )
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])
+
+        # Stage 3: correction token special tokens + projector (disabled by default)
+        self._stage3_enabled     = False
+        self.correction_projector = None
+        self._correction_token_ids = None  # list of token IDs for <|correction_i|>
 
         # KF state (populated by load_kf; None = KF disabled)
         self._lds       = None
@@ -176,6 +182,247 @@ class VLA_JEPA(baseframework):
         self._vj_prev_obs   = None
         self._prev_action_t = None
         self._last_vj_pred  = None
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Stage 3: QwenVL correction-token injection
+    # ──────────────────────────────────────────────────────────────────────
+
+    def load_stage3(
+        self,
+        n_correction_tokens: int = 8,
+        use_lora: bool = False,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+    ) -> None:
+        """
+        Enable Stage 3 mode:
+          - Registers <|correction_i|> special tokens into QwenVL's tokenizer
+          - Instantiates CorrectionProjector (vj_dim → qwen_dim)
+          - Optionally wraps QwenVL with LoRA for joint adaptation
+          - Builds correction_replace_prompt to be appended after action tokens
+
+        Call once after model construction, before training or inference.
+        """
+        tokenizer = self.qwen_vl_interface.processor.tokenizer
+        corr_tokens = [f"<|correction_{i}|>" for i in range(n_correction_tokens)]
+
+        # Add only tokens not already in vocab
+        new_tokens = [t for t in corr_tokens if t not in tokenizer.get_vocab()]
+        if new_tokens:
+            tokenizer.add_tokens(new_tokens, special_tokens=True)
+            self.qwen_vl_interface.model.resize_token_embeddings(len(tokenizer))
+            logger.info(f"[Stage3] Added {len(new_tokens)} correction tokens to tokenizer.")
+
+        self._correction_token_ids = torch.tensor(
+            [tokenizer.convert_tokens_to_ids(t) for t in corr_tokens], dtype=torch.long
+        )
+
+        vj_dim  = self.vj_encoder.config.hidden_size * 2
+        qwen_dim = self.qwen_vl_interface.model.config.hidden_size
+        self.correction_projector = CorrectionProjector(
+            vj_dim=vj_dim, qwen_dim=qwen_dim, n_tokens=n_correction_tokens
+        )
+        # correction_replace_prompt: appended after self.replace_prompt for Stage 3
+        self.correction_replace_prompt = "".join(corr_tokens)
+        self._stage3_enabled = True
+        self._vj_prev_obs    = None
+        self._last_vj_pred   = None
+
+        # Save reference to Qwen2_5_VLModel BEFORE any LoRA wrapping so that
+        # _run_qwen_with_correction can access it directly regardless of PeftModel layers.
+        self._qwen_inner_model = self.qwen_vl_interface.model.model  # Qwen2_5_VLModel
+
+        if use_lora:
+            from peft import LoraConfig, get_peft_model
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=["q_proj", "v_proj"],
+                lora_dropout=lora_dropout,
+                bias="none",
+            )
+            self.qwen_vl_interface.model = get_peft_model(
+                self.qwen_vl_interface.model, lora_config
+            )
+            self._stage3_lora = True
+            logger.info(
+                f"[Stage3] LoRA applied to QwenVL  r={lora_r}  alpha={lora_alpha}  "
+                f"target=[q_proj, v_proj]"
+            )
+        else:
+            self._stage3_lora = False
+
+        logger.info(f"[Stage3] Correction projector ready  n_tokens={n_correction_tokens}  "
+                    f"vj_dim={vj_dim}  qwen_dim={qwen_dim}  lora={use_lora}")
+
+    def _run_qwen_with_correction(
+        self,
+        batch_images: list,
+        instructions: list,
+        delta_z: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Run QwenVL with Δz-projected correction tokens injected between
+        action_tokens and embodied_action_tokens.
+
+        Steps:
+          1. Build qwen_inputs with extended replace_prompt
+             ({actions} → action_tokens + correction_token_placeholders)
+          2. Manually get text embeddings + merge image features
+          3. Replace correction token positions with CorrectionProjector(Δz)
+          4. Compute correct position_ids (preserves 3D RoPE for vision tokens)
+          5. Run inner language model; return last hidden states
+
+        Args:
+            batch_images:  List[List[PIL.Image]] of shape [B][V]
+            instructions:  List[str] of length B
+            delta_z:       (B, spatial, vj_dim) prediction error tensor (on model device)
+
+        Returns:
+            last_hidden: (B, L, qwen_dim) final hidden states from QwenVL
+        """
+        # Stage 3 replace prompt = action_tokens + correction_placeholder_tokens
+        stage3_replace = self.replace_prompt + self.correction_replace_prompt
+
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            instructions=instructions,
+            prompt_replace_dict={
+                "{actions}":   stage3_replace,
+                "{e_actions}": self.embodied_replace_prompt,
+            },
+            prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""),
+        )
+
+        input_ids      = qwen_inputs["input_ids"]
+        attention_mask = qwen_inputs.get("attention_mask")
+        pixel_values   = qwen_inputs.get("pixel_values")
+        image_grid_thw = qwen_inputs.get("image_grid_thw")
+
+        # Qwen2_5_VLModel — use cached reference so PeftModel wrapping doesn't shift the path
+        inner_model = getattr(self, "_qwen_inner_model", self.qwen_vl_interface.model.model)
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            # 1. Text embeddings (image placeholder positions still have text embedding)
+            inputs_embeds = inner_model.get_input_embeddings()(input_ids)
+
+            # 2. Merge image features
+            if pixel_values is not None:
+                image_embeds_list = inner_model.get_image_features(pixel_values, image_grid_thw)
+                image_embeds = torch.cat(image_embeds_list, dim=0).to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+                image_mask, _ = inner_model.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            # 3. Inject correction embeddings at <|correction_i|> positions
+            corr_ids = self._correction_token_ids.to(input_ids.device)
+            corr_mask = torch.isin(input_ids, corr_ids)  # (B, L)
+            corr_embeds = self.correction_projector(delta_z.to(inputs_embeds.dtype))  # (B, N, qwen_dim)
+            inputs_embeds[corr_mask] = corr_embeds.reshape(-1, inputs_embeds.shape[-1])
+
+            # 4. Compute position_ids preserving 3D RoPE for vision tokens
+            position_ids, rope_deltas = inner_model.get_rope_index(
+                input_ids, image_grid_thw, None, attention_mask=attention_mask
+            )
+            inner_model.rope_deltas = rope_deltas
+
+            # 5. Run language model directly (skip vision processing in forward)
+            outputs = inner_model.language_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        return outputs.hidden_states[-1]  # (B, L, qwen_dim)
+
+    @torch.inference_mode()
+    def _predict_action_stage3(
+        self,
+        batch_images: list,
+        instructions: list,
+        state=None,
+        **kwargs,
+    ) -> dict:
+        """
+        Stage 3 inference:
+          1. V-JEPA encode current frame → vj_obs_t
+          2. Δz = vj_obs_t - _last_vj_pred  (zeros at t=0)
+          3. Run QwenVL with correction injection → last_hidden
+          4. Extract action_tokens, embodied_action_tokens
+          5. V-JEPA predictor → vj_pred for next step
+          6. DiT → action
+        """
+        # Step 1: V-JEPA encode (needed before QwenVL to compute Δz)
+        vj_obs_t = self._encode_vj_from_images(batch_images)  # (B, spatial, D)
+        B = vj_obs_t.shape[0]
+
+        # Step 2: Δz
+        if self._last_vj_pred is not None:
+            delta_z = (vj_obs_t - self._last_vj_pred.to(vj_obs_t.device)).float()
+        else:
+            delta_z = torch.zeros_like(vj_obs_t).float()
+
+        # Step 3: QwenVL with correction injection
+        last_hidden = self._run_qwen_with_correction(batch_images, instructions, delta_z)
+        # last_hidden: (B, L, qwen_dim)
+
+        # Step 4a: embodied_action_tokens
+        emb_id_tensor = torch.tensor([self.embodied_action_token_id], device=last_hidden.device)
+        # We need input_ids to find positions — rebuild without autocast side effects
+        qwen_inputs_tmp = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            instructions=instructions,
+            prompt_replace_dict={
+                "{actions}":   self.replace_prompt + self.correction_replace_prompt,
+                "{e_actions}": self.embodied_replace_prompt,
+            },
+            prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""),
+        )
+        input_ids_tmp = qwen_inputs_tmp["input_ids"]
+
+        emb_mask = torch.isin(input_ids_tmp, emb_id_tensor).nonzero(as_tuple=True)
+        H = last_hidden.shape[-1]
+        embodied_action_tokens = last_hidden[emb_mask[0], emb_mask[1], :].view(B, -1, H)
+
+        # Step 4b: action_tokens for vj_predictor
+        act_id_tensor = torch.tensor(self.action_token_ids, device=last_hidden.device)
+        act_mask = torch.isin(input_ids_tmp, act_id_tensor).nonzero(as_tuple=True)
+        action_tokens_for_pred = last_hidden[act_mask[0], act_mask[1], :].view(B, -1, H)
+
+        # Step 5: V-JEPA predictor → vj_pred for next step
+        tubelet  = self.vj_encoder.config.tubelet_size
+        T_pred   = self.config.framework.vj2_model.num_frames // tubelet - 1
+        num_add  = self.config.framework.vj2_model.num_action_tokens_per_timestep
+        prev_exp = vj_obs_t.repeat(1, T_pred, 1)
+        prev_act = action_tokens_for_pred[:, : T_pred * num_add, :]
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            vj_pred_raw = self.vj_predictor(prev_exp, prev_act)
+        spatial = vj_obs_t.shape[1]
+        vj_pred_t = vj_pred_raw[:, -spatial:, :].float()
+
+        # Update recurrent state
+        self._vj_prev_obs   = vj_obs_t.detach()
+        self._last_vj_pred  = vj_pred_t.detach()
+        self._prev_action_t = action_tokens_for_pred.detach()
+
+        # Step 6: DiT → action
+        state_tensor = (
+            torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype)
+            if state is not None else None
+        )
+        with torch.autocast("cuda", dtype=torch.float32):
+            pred_actions = self.action_model.predict_action(embodied_action_tokens, state_tensor)
+
+        return {
+            "normalized_actions":    pred_actions.detach().cpu().numpy(),
+            "embodied_action_tokens": embodied_action_tokens.float().detach().cpu().numpy(),
+        }
 
     def _encode_vj_from_images(self, batch_images: list) -> torch.Tensor:
         """Encode current-frame PIL images through V-JEPA encoder.
@@ -453,7 +700,11 @@ class VLA_JEPA(baseframework):
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
-    
+
+        # ── Stage 3: correction-token injection path ──────────────────────
+        if self._stage3_enabled:
+            return self._predict_action_stage3(batch_images, instructions, state, **kwargs)
+
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
             images=batch_images, 

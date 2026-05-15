@@ -49,6 +49,26 @@ def main(args) -> None:
         missing, unexpected = vla.load_state_dict(phase2_sd, strict=False)
         logging.info("Recurrent-JEPA Phase 2 loaded: %s  missing=%d  unexpected=%d",
                      args.recurrent_ckpt, len(missing), len(unexpected))
+    elif args.stage3_ckpt:
+        # Stage 3: load CorrectionProjector (+ optional LoRA) weights
+        ckpt = torch.load(args.stage3_ckpt, map_location=device, weights_only=False)
+        n_corr = ckpt.get("n_correction_tokens", 8)
+        use_lora = ckpt.get("use_lora", False) and "lora_state_dict" in ckpt
+        vla.load_stage3(
+            n_correction_tokens=n_corr,
+            use_lora=use_lora,
+            lora_r=ckpt.get("lora_r", 16),
+            lora_alpha=ckpt.get("lora_alpha", 32),
+        )
+        vla.correction_projector = vla.correction_projector.to(device)
+        vla.correction_projector.load_state_dict(ckpt["correction_projector"])
+        if use_lora:
+            from peft import set_peft_model_state_dict
+            set_peft_model_state_dict(vla.qwen_vl_interface.model, ckpt["lora_state_dict"])
+            logging.info("Stage3 LoRA weights loaded.")
+        vla.correction_projector.eval()
+        logging.info("Stage3 CorrectionProjector loaded from %s  (val_loss=%.4f  epoch=%d  lora=%s)",
+                     args.stage3_ckpt, ckpt.get("val_loss", -1), ckpt.get("epoch", -1), use_lora)
     elif args.recurrent:
         vla.load_recurrent()
         logging.info("Recurrent-JEPA enabled (Phase 1 sanity check)")
@@ -80,6 +100,7 @@ def build_argparser():
     parser.add_argument("--ema_alpha", type=float, default=None, help="EMA smoothing alpha (0~1); overridden by --lds_path")
     parser.add_argument("--recurrent", action="store_true", help="Enable Recurrent-JEPA inference (Phase 1: cos_sim logging)")
     parser.add_argument("--recurrent_ckpt", type=str, default=None, help="Phase 2 fine-tuned checkpoint (fusion+vj_to_dit+action_model)")
+    parser.add_argument("--stage3_ckpt", type=str, default=None, help="Stage 3 CorrectionProjector checkpoint")
     return parser
 
 
