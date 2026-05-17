@@ -103,11 +103,11 @@ def train(args):
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=2, pin_memory=False, collate_fn=stage3_collate_fn,
+        num_workers=args.num_workers, pin_memory=False, collate_fn=stage3_collate_fn,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=1, pin_memory=False, collate_fn=stage3_collate_fn,
+        num_workers=max(1, args.num_workers // 2), pin_memory=False, collate_fn=stage3_collate_fn,
     )
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -253,8 +253,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int,   default=4)
     parser.add_argument("--lr",         type=float, default=1e-4)
     parser.add_argument("--log_freq",   type=int,   default=10)
-    parser.add_argument("--no_lora",    action="store_true", help="Disable LoRA (train CorrectionProjector only)")
-    parser.add_argument("--lora_r",     type=int,   default=16)
-    parser.add_argument("--lora_alpha", type=int,   default=32)
+    parser.add_argument("--no_lora",     action="store_true", help="Disable LoRA (train CorrectionProjector only)")
+    parser.add_argument("--lora_r",      type=int,   default=16)
+    parser.add_argument("--lora_alpha",  type=int,   default=32)
+    parser.add_argument("--num_workers", type=int,   default=4)
     args = parser.parse_args()
     train(args)

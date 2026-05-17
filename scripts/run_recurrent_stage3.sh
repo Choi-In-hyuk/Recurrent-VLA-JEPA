@@ -67,11 +67,12 @@ echo ""
 echo "[2/3] Training CorrectionProjector + QwenVL LoRA..."
 ${SIM_PYTHON} -u scripts/train_recurrent_stage3.py \
     --epochs 30 \
-    --max_steps 10000 \
-    --batch_size 4 \
+    --max_steps 24000 \
+    --batch_size 16 \
     --lr 1e-4 \
     --lora_r 16 \
-    --lora_alpha 32
+    --lora_alpha 32 \
+    --num_workers 4
 echo "Training complete. Best checkpoint: ${STAGE3_CKPT}"
 
 # ── Step 3: Evaluation ───────────────────────────────────────────

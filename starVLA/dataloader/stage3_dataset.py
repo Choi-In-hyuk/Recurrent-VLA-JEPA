@@ -13,6 +13,7 @@ scripts/extract_recurrent_tokens.py which saves Stage 3 metadata
 """
 
 import glob
+import json
 import os
 import random
 
@@ -32,21 +33,44 @@ class Stage3Dataset(Dataset):
             data_dirs: list of dataset directories, each with <split>/*.pt files
             split:     "train" or "val"
         """
-        self.paths = []
+        all_paths = []
         for d in data_dirs:
             pt_dir = os.path.join(d, split)
             if os.path.isdir(pt_dir):
-                self.paths.extend(sorted(glob.glob(os.path.join(pt_dir, "*.pt"))))
+                all_paths.extend(sorted(glob.glob(os.path.join(pt_dir, "*.pt"))))
+
+        # Cache valid paths to avoid re-scanning all .pt files every run
+        cache_key = "_".join(sorted(data_dirs)).replace("/", "_")
+        cache_path = os.path.join(
+            os.path.dirname(data_dirs[0]),
+            f".stage3_cache_{split}_{abs(hash(cache_key)) % 10**8}.json",
+        )
+
+        if os.path.exists(cache_path):
+            with open(cache_path) as f:
+                valid = json.load(f)
+            # Invalidate cache if file count changed
+            if len(valid) != len(all_paths):
+                valid = None
+        else:
+            valid = None
+
+        if valid is None:
+            print(f"[Stage3Dataset] Scanning {len(all_paths)} files for metadata ({split})...")
+            valid = []
+            for p in all_paths:
+                try:
+                    data = torch.load(p, weights_only=False)
+                    if "hdf5_path" in data and "instruction" in data:
+                        valid.append(p)
+                except Exception:
+                    pass
+            with open(cache_path, "w") as f:
+                json.dump(valid, f)
+            print(f"[Stage3Dataset] Cache saved → {cache_path}")
 
         rng = random.Random(seed)
-        rng.shuffle(self.paths)
-
-        # Filter out samples without Stage 3 metadata (old extraction format)
-        valid = []
-        for p in self.paths:
-            data = torch.load(p, weights_only=False)
-            if "hdf5_path" in data and "instruction" in data:
-                valid.append(p)
+        rng.shuffle(valid)
         self.paths = valid
         print(f"[Stage3Dataset] {split}: {len(self.paths)} samples with metadata")
 
