@@ -307,12 +307,13 @@ class VLA_JEPA(baseframework):
             # 1. Text embeddings (image placeholder positions still have text embedding)
             inputs_embeds = inner_model.get_input_embeddings()(input_ids)
 
-            # 2. Merge image features
+            # 2. Merge image features (call visual directly to avoid split/tuple ambiguity)
             if pixel_values is not None:
-                image_embeds_list = inner_model.get_image_features(pixel_values, image_grid_thw)
-                image_embeds = torch.cat(image_embeds_list, dim=0).to(
-                    inputs_embeds.device, inputs_embeds.dtype
-                )
+                pv = pixel_values.type(inner_model.visual.dtype)
+                image_embeds = inner_model.visual(pv, grid_thw=image_grid_thw)
+                if isinstance(image_embeds, tuple):
+                    image_embeds = image_embeds[0]
+                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 image_mask, _ = inner_model.get_placeholder_mask(
                     input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
                 )
