@@ -13,6 +13,7 @@ scripts/extract_recurrent_tokens.py which saves Stage 3 metadata
 """
 
 import glob
+import hashlib
 import json
 import os
 import random
@@ -40,10 +41,11 @@ class Stage3Dataset(Dataset):
                 all_paths.extend(sorted(glob.glob(os.path.join(pt_dir, "*.pt"))))
 
         # Cache valid paths to avoid re-scanning all .pt files every run
-        cache_key = "_".join(sorted(data_dirs)).replace("/", "_")
+        cache_key = "_".join(sorted(data_dirs))
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
         cache_path = os.path.join(
             os.path.dirname(data_dirs[0]),
-            f".stage3_cache_{split}_{abs(hash(cache_key)) % 10**8}.json",
+            f".stage3_cache_{split}_{cache_hash}.json",
         )
 
         if os.path.exists(cache_path):
