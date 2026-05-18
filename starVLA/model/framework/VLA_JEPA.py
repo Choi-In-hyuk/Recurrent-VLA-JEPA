@@ -300,11 +300,11 @@ class VLA_JEPA(baseframework):
         pixel_values   = qwen_inputs.get("pixel_values")
         image_grid_thw = qwen_inputs.get("image_grid_thw")
 
-        # Qwen2_5_VLModel — use cached reference so PeftModel wrapping doesn't shift the path
+        # Qwen2_5_VLModel — used for embedding lookup, image encoding, and rope index
         inner_model = getattr(self, "_qwen_inner_model", self.qwen_vl_interface.model.model)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            # 1. Text embeddings (image placeholder positions still have text embedding)
+            # 1. Text embeddings
             inputs_embeds = inner_model.get_input_embeddings()(input_ids)
 
             # 2. Merge image features (call visual directly to avoid split/tuple ambiguity)
@@ -331,16 +331,26 @@ class VLA_JEPA(baseframework):
             )
             inner_model.rope_deltas = rope_deltas
 
-            # 5. Run language model directly (skip vision processing in forward)
-            outputs = inner_model.language_model(
+            # 5. Run through full model (PeftModel → LoRA active) with pre-merged inputs_embeds.
+            #    pixel_values=None prevents the model from attempting to re-merge image features.
+            outputs = self.qwen_vl_interface.model(
+                input_ids=None,
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                pixel_values=None,
+                image_grid_thw=None,
                 output_hidden_states=True,
                 return_dict=True,
             )
 
-        return outputs.hidden_states[-1]  # (B, L, qwen_dim)
+        # hidden_states[-1]: (B, L, qwen_dim)
+        last_hidden = outputs.hidden_states[-1]
+        if last_hidden.dim() != 3:
+            raise RuntimeError(
+                f"[Stage3] Expected 3D hidden states (B, L, H), got shape {last_hidden.shape}"
+            )
+        return last_hidden
 
     @torch.inference_mode()
     def _predict_action_stage3(
@@ -413,12 +423,18 @@ class VLA_JEPA(baseframework):
         self._prev_action_t = action_tokens_for_pred.detach()
 
         # Step 6: DiT → action
-        state_tensor = (
-            torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype)
-            if state is not None else None
-        )
+        if state is not None:
+            state_tensor = torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=torch.float32)
+            if state_tensor.dim() > 2:
+                state_tensor = state_tensor.squeeze()
+            if state_tensor.dim() == 1:
+                state_tensor = state_tensor.unsqueeze(0)
+        else:
+            state_tensor = None
         with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(embodied_action_tokens, state_tensor)
+            pred_actions = self.action_model.predict_action(
+                embodied_action_tokens.float(), state_tensor
+            )
 
         return {
             "normalized_actions":    pred_actions.detach().cpu().numpy(),
